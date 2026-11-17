@@ -553,3 +553,132 @@ def mouvement(pdv_id: int, data: MouvementIn, db: Session = Depends(get_db), use
                               quantite=data.quantite, commentaire=data.commentaire))
     db.commit()
     return {"article_id": data.article_id, "pdv_id": pdv_id, "quantite_apres": s.quantite}
+# --- Clients ---
+@app.post("/api/entites/{entite_id}/clients", response_model=ClientOut, status_code=201)
+def create_client(entite_id: int, data: ClientIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not db.query(Entite).get(entite_id): raise HTTPException(status_code=404, detail="Entité introuvable")
+    c = Client(entite_id=entite_id, **data.model_dump()); db.add(c); db.commit(); db.refresh(c); return c
+
+@app.get("/api/entites/{entite_id}/clients", response_model=list[ClientOut])
+def list_clients(entite_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return db.query(Client).filter(Client.entite_id == entite_id).all()
+
+@app.post("/api/clients/{client_id}/contacts", status_code=201)
+def add_contact(client_id: int, nom: str, email: str | None = None, telephone: str | None = None,
+                db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not db.query(Client).get(client_id): raise HTTPException(status_code=404, detail="Client introuvable")
+    c = ContactClient(client_id=client_id, nom=nom, email=email, telephone=telephone)
+    db.add(c); db.commit(); return {"id": c.id, "nom": nom}
+
+# --- Chaîne documentaire : devis -> commande -> BL -> facture ---
+@app.post("/api/documents", response_model=DocumentOut, status_code=201)
+def create_document(data: DocumentIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    for l in data.lignes:
+        if not db.query(Article).get(l.article_id): raise HTTPException(status_code=404, detail="Article introuvable")
+    return creer_document(db, data.entite_id, data.client_id, data.type,
+                          [l.model_dump() for l in data.lignes], data.pdv_id)
+
+@app.get("/api/documents", response_model=list[DocumentOut])
+def list_documents(entite_id: int | None = None, type: TypeDocument | None = None,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    q = db.query(Document)
+    if entite_id: q = q.filter(Document.entite_id == entite_id)
+    if type: q = q.filter(Document.type == type)
+    return q.order_by(Document.date.desc()).all()
+
+@app.post("/api/documents/{doc_id}/transformer", response_model=DocumentOut)
+def transform(doc_id: int, nouvelle_type: TypeDocument, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    doc = db.query(Document).get(doc_id)
+    if not doc: raise HTTPException(status_code=404, detail="Document introuvable")
+    try:
+        nouveau = transformer(doc, db, nouvelle_type)
+        if nouvelle_type == TypeDocument.BON_LIVRAISON:
+            appliquer_stock_bl(db, nouveau)  # sortie de stock à la validation du BL
+            db.commit(); db.refresh(nouveau)
+    except DocumentError as e:
+        db.rollback(); raise HTTPException(status_code=409, detail=str(e))
+    return nouveau
+
+# --- GMAO : parc IT, tickets SAV, contrats ---
+@app.post("/api/gmao/equipements", response_model=EquipementOut, status_code=201)
+def create_equipement(data: EquipementIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    e = Equipement(**data.model_dump()); db.add(e); db.commit(); db.refresh(e); return e
+
+@app.get("/api/gmao/equipements", response_model=list[EquipementOut])
+def list_equipements(client_id: int | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    q = db.query(Equipement)
+    if client_id: q = q.filter(Equipement.client_id == client_id)
+    return q.all()
+
+@app.post("/api/gmao/tickets", response_model=TicketOut, status_code=201)
+def create_ticket(data: TicketIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    t = TicketSAV(**data.model_dump()); db.add(t); db.commit(); db.refresh(t); return t
+
+@app.get("/api/gmao/tickets", response_model=list[TicketOut])
+def list_tickets(statut: StatutTicket | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    q = db.query(TicketSAV)
+    if statut: q = q.filter(TicketSAV.statut == statut)
+    return q.order_by(TicketSAV.date_ouverture.desc()).all()
+
+@app.patch("/api/gmao/tickets/{tid}", response_model=TicketOut)
+def update_ticket(tid: int, statut: StatutTicket | None = None, technicien_id: int | None = None,
+                  temps_passe_minutes: int | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    t = db.query(TicketSAV).get(tid)
+    if not t: raise HTTPException(status_code=404, detail="Ticket introuvable")
+    if statut: t.statut = statut
+    if technicien_id is not None: t.technicien_id = technicien_id
+    if temps_passe_minutes is not None: t.temps_passe_minutes = temps_passe_minutes
+    db.commit(); db.refresh(t); return t
+
+@app.post("/api/gmao/contrats", response_model=ContratOut, status_code=201)
+def create_contrat(data: ContratIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    n = db.query(ContratMaintenance).filter(ContratMaintenance.entite_id == data.entite_id).count()
+    c = ContratMaintenance(entite_id=data.entite_id, client_id=data.client_id, libelle=data.libelle,
+                           numero=f"CTR-{datetime.now().year}-{n + 1:04d}", date_debut=datetime.utcnow(),
+                           montant_ht=data.montant_ht, periodicite_jours=data.periodicite_jours,
+                           delai_intervention_heures=data.delai_intervention_heures)
+    db.add(c); db.commit(); db.refresh(c); return c
+
+@app.get("/api/gmao/contrats", response_model=list[ContratOut])
+def list_contrats(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return db.query(ContratMaintenance).filter(ContratMaintenance.actif == True).all()
+
+# --- Dashboard groupe (les 3 sociétés consolidées) ---
+@app.get("/api/dashboard/groupe")
+def dashboard(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    ca = (db.query(Entite.nom, func.sum(Document.total_ttc)).join(Document, Document.entite_id == Entite.id)
+          .filter(Document.type == TypeDocument.FACTURE).group_by(Entite.nom).all())
+    return {
+        "ca_ttc_par_entite": {n: float(t) for n, t in ca},
+        "stock_total_groupe": db.query(func.coalesce(func.sum(Stock.quantite), 0)).scalar(),
+        "tickets_ouverts": db.query(func.count(TicketSAV.id)).filter(
+            TicketSAV.statut.in_([StatutTicket.OUVERT, StatutTicket.EN_COURS])).scalar(),
+        "factures_impayees": db.query(func.count(Document.id)).filter(
+            Document.type == TypeDocument.FACTURE, Document.statut != StatutDocument.PAYE).scalar(),
+    }
+
+# --- E-commerce (vente en ligne prévue) ---
+@app.get("/api/shop/catalogue")
+def shop_catalogue(db: Session = Depends(get_db)):
+    return [{"reference": a.reference, "designation": a.designation, "categorie": a.categorie.value,
+             "prix_vente": float(a.prix_vente), "tva_taux": float(a.tva_taux)}
+            for a in db.query(Article).filter(Article.actif == True).all()]
+
+@app.get("/api/shop/stock/{reference}")
+def shop_stock(reference: str, db: Session = Depends(get_db)):
+    a = db.query(Article).filter(Article.reference == reference).first()
+    if not a: raise HTTPException(status_code=404, detail="Article introuvable")
+    rows = (db.query(Stock, PointDeVente).join(PointDeVente, Stock.pdv_id == PointDeVente.id)
+            .filter(Stock.article_id == a.id).all())
+    return {"reference": reference, "disponible_total": sum(s.quantite for s, _ in rows),
+            "par_pdv": [{"pdv": p.nom, "quantite": s.quantite} for s, p in rows]}
+
+@app.post("/api/shop/commandes", status_code=201)
+def shop_commande(data: CommandeShop, db: Session = Depends(get_db)):
+    lignes = []
+    for l in data.lignes:
+        a = db.query(Article).filter(Article.reference == l.reference).first()
+        if not a: raise HTTPException(status_code=404, detail=f"Référence inconnue: {l.reference}")
+        lignes.append({"article_id": a.id, "quantite": l.quantite, "prix_unitaire": float(a.prix_vente)})
+    doc = creer_document(db, data.entite_id, data.client_id, TypeDocument.COMMANDE, lignes, data.pdv_id)
+    return {"numero": doc.numero, "total_ttc": float(doc.total_ttc), "statut": doc.statut.value}
