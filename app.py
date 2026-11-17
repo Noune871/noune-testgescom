@@ -94,7 +94,7 @@ class User(Base):
     role: Mapped[Role] = mapped_column(SAEnum(Role), default=Role.EMPLOYE)
     actif: Mapped[bool] = mapped_column(Boolean, default=True)
     entites: Mapped[list["UserEntite"]] = relationship(back_populates="user")
-    pdv: Mapped[list["UserPdv"]] = relationship(back_populates="pdv")
+    pdv: Mapped[list["UserPdv"]] = relationship(back_populates="user")
 
 class UserEntite(Base):
     __tablename__ = "user_entite"
