@@ -230,3 +230,185 @@ class TicketSAV(Base):
     description: Mapped[str | None] = mapped_column(Text)
     priorite: Mapped[PrioriteTicket] = mapped_column(SAEnum(PrioriteTicket), default=PrioriteTicket.NORMALE)
     statut: Mapped[StatutTicket] = mapped_column(SAEnum(StatutTicket), default=StatutTicket.OUVERT)
+    date_ouverture: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    date_resolution: Mapped[datetime | None] = mapped_column(DateTime)
+    temps_passe_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    equipement: Mapped[Equipement | None] = relationship(back_populates="tickets")
+
+class ContratMaintenance(Base):
+    __tablename__ = "contrat_maintenance"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entite_id: Mapped[int] = mapped_column(ForeignKey("entite.id"))
+    client_id: Mapped[int] = mapped_column(ForeignKey("client.id"))
+    numero: Mapped[str] = mapped_column(String(40))
+    libelle: Mapped[str] = mapped_column(String(200))
+    date_debut: Mapped[datetime] = mapped_column(DateTime)
+    date_fin: Mapped[datetime | None] = mapped_column(DateTime)
+    periodicite_jours: Mapped[int] = mapped_column(Integer, default=365)
+    montant_ht: Mapped[float] = mapped_column(Numeric(12, 2), default=0)
+    delai_intervention_heures: Mapped[int | None] = mapped_column(Integer)  # SLA
+    actif: Mapped[bool] = mapped_column(Boolean, default=True)
+    __table_args__ = (UniqueConstraint("entite_id", "numero"),)
+
+Base.metadata.create_all(bind=engine)
+
+# ============================== DÉPENDANCES DROITS ==============================
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    try:
+        payload = decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token invalide ou expiré")
+    user = db.query(User).get(int(payload["sub"]))
+    if not user or not user.actif:
+        raise HTTPException(status_code=401, detail="Utilisateur invalide")
+    return user
+
+def require_role(*roles: str):
+    def dep(user: User = Depends(get_current_user)) -> User:
+        if user.role.value not in roles:
+            raise HTTPException(status_code=403, detail="Droits insuffisants")
+        return user
+    return dep
+
+# ============================== SCHÉMAS ==============================
+class ArticleIn(BaseModel):
+    reference: str = Field(..., max_length=80)
+    designation: str = Field(..., max_length=300)
+    categorie: CategorieArticle = CategorieArticle.MATERIEL
+    prix_achat: float = 0; prix_vente: float = 0; tva_taux: float = 20
+    seuil_alerte: int = 0
+    duree_licence_jours: int | None = None; nb_postes: int | None = None
+
+class ArticleOut(BaseModel):
+    id: int; reference: str; designation: str; categorie: str
+    prix_vente: float; actif: bool
+    class Config: from_attributes = True
+
+class EntiteIn(BaseModel):
+    nom: str = Field(..., max_length=120); siret: str | None = Field(default=None, max_length=14)
+class EntiteOut(BaseModel):
+    id: int; nom: str; actif: bool
+    class Config: from_attributes = True
+
+class PdvIn(BaseModel):
+    nom: str = Field(..., max_length=120); adresse: str | None = None
+class PdvOut(BaseModel):
+    id: int; nom: str; entite_id: int; actif: bool
+    class Config: from_attributes = True
+
+class ClientIn(BaseModel):
+    nom: str = Field(..., max_length=200); siret: str | None = None
+    email: str | None = None; telephone: str | None = None; adresse_facturation: str | None = None
+class ClientOut(BaseModel):
+    id: int; nom: str; email: str | None
+    contacts: list[dict] = []; adresses: list[dict] = []
+    class Config: from_attributes = True
+
+class MouvementIn(BaseModel):
+    article_id: int; quantite: int = Field(..., gt=0)
+    type: TypeMouvement = TypeMouvement.ENTREE
+    commentaire: str | None = None; pdv_cible_id: int | None = None
+
+class LigneDocIn(BaseModel):
+    article_id: int; quantite: int = Field(..., gt=0)
+    prix_unitaire: float = Field(..., ge=0); remise: float = Field(default=0, ge=0, le=100)
+class LigneDocOut(BaseModel):
+    article_id: int; quantite: int; prix_unitaire: float; remise: float
+    class Config: from_attributes = True
+class DocumentIn(BaseModel):
+    entite_id: int; client_id: int; type: TypeDocument
+    pdv_id: int | None = None; lignes: list[LigneDocIn]
+class DocumentOut(BaseModel):
+    id: int; numero: str; type: str; statut: str
+    total_ht: float; total_ttc: float; entite_id: int; client_id: int; pdv_id: int | None
+    lignes: list[LigneDocOut]
+    class Config: from_attributes = True
+
+class UserIn(BaseModel):
+    email: str; password: str = Field(..., min_length=8); nom: str
+    role: Role = Role.EMPLOYE; entite_ids: list[int] = []; pdv_ids: list[int] = []
+class UserOut(BaseModel):
+    id: int; email: str; nom: str; role: str; actif: bool
+    entites: list[int] = []; pdv: list[int] = []
+    class Config: from_attributes = True
+
+class EquipementIn(BaseModel):
+    entite_id: int; client_id: int | None = None; pdv_id: int | None = None
+    designation: str = Field(..., max_length=300); categorie: str = "materiel"
+    marque: str | None = None; modele: str | None = None; numero_serie: str | None = None
+class EquipementOut(BaseModel):
+    id: int; designation: str; categorie: str; numero_serie: str | None
+    class Config: from_attributes = True
+
+class TicketIn(BaseModel):
+    entite_id: int; client_id: int; sujet: str = Field(..., max_length=300)
+    description: str | None = None; equipement_id: int | None = None
+    priorite: PrioriteTicket = PrioriteTicket.NORMALE
+class TicketOut(BaseModel):
+    id: int; sujet: str; statut: str; priorite: str; client_id: int
+    class Config: from_attributes = True
+
+class ContratIn(BaseModel):
+    entite_id: int; client_id: int; libelle: str = Field(..., max_length=200)
+    montant_ht: float = 0; periodicite_jours: int = 365
+    delai_intervention_heures: int | None = None
+class ContratOut(BaseModel):
+    id: int; numero: str; libelle: str; montant_ht: float; actif: bool
+    delai_intervention_heures: int | None
+    class Config: from_attributes = True
+
+class LigneShop(BaseModel):
+    reference: str; quantite: int = Field(..., gt=0)
+class CommandeShop(BaseModel):
+    entite_id: int; client_id: int; pdv_id: int | None = None; lignes: list[LigneShop]
+
+# ============================== SERVICES MÉTIER ==============================
+class DocumentError(Exception): pass
+
+def _numero(db: Session, entite_id: int, type_: TypeDocument) -> str:
+    prefix = {"devis": "DEV", "commande": "CMD", "bon_livraison": "BL", "facture": "FA", "avoir": "AV"}[type_.value]
+    n = db.query(Document).filter(Document.entite_id == entite_id, Document.type == type_).count()
+    return f"{prefix}-{datetime.now().year}-{n + 1:04d}"
+
+def recalculer(doc: Document, db: Session):
+    ht = tva = 0.0
+    for l in doc.lignes:
+        base = l.quantite * float(l.prix_unitaire) * (1 - float(l.remise) / 100)
+        ht += base
+        art = db.query(Article).get(l.article_id)
+        tva += base * float(art.tva_taux) / 100
+    doc.total_ht, doc.total_ttc = ht, ht + tva
+
+def creer_document(db, entite_id, client_id, type_, lignes, pdv_id=None, parent_id=None) -> Document:
+    doc = Document(entite_id=entite_id, pdv_id=pdv_id, client_id=client_id, type=type_,
+                   numero=_numero(db, entite_id, type_), parent_id=parent_id)
+    db.add(doc); db.flush()
+    for l in lignes:
+        db.add(LigneDocument(document_id=doc.id, article_id=l["article_id"], quantite=l["quantite"],
+                             prix_unitaire=l["prix_unitaire"], remise=l.get("remise", 0)))
+    db.flush(); recalculer(doc, db); db.commit(); db.refresh(doc)
+    return doc
+
+CHAINE = {TypeDocument.DEVIS: TypeDocument.COMMANDE,
+          TypeDocument.COMMANDE: TypeDocument.BON_LIVRAISON,
+          TypeDocument.BON_LIVRAISON: TypeDocument.FACTURE}
+
+def transformer(doc: Document, db: Session, nouveau: TypeDocument) -> Document:
+    if CHAINE.get(doc.type) != nouveau:
+        raise DocumentError(f"Transformation {doc.type.value} -> {nouveau.value} interdite")
+    lignes = [{"article_id": l.article_id, "quantite": l.quantite,
+               "prix_unitaire": float(l.prix_unitaire), "remise": float(l.remise)} for l in doc.lignes]
+    return creer_document(db, doc.entite_id, doc.client_id, nouveau, lignes, doc.pdv_id, doc.id)
+
+def appliquer_stock_bl(db: Session, bl: Document):
+    if not bl.pdv_id: return
+    for ligne in bl.lignes:
+        stock = db.query(Stock).get((ligne.article_id, bl.pdv_id))
+        qte = stock.quantite if stock else 0
+        if qte < ligne.quantite:
+            raise DocumentError(f"Stock insuffisant (dispo {qte}, demandé {ligne.quantite})")
+        if not stock:
+            stock = Stock(article_id=ligne.article_id, pdv_id=bl.pdv_id, quantite=0); db.add(stock)
+        stock.quantite -= ligne.quantite
+        db.add(MouvementStock(article_id=ligne.article_id, pdv_id=bl.pdv_id, type=TypeMouvement.SORTIE,
+                              quantite=ligne.quantite, document_id=bl.id, commentaire=f"BL {bl.numero}"))
