@@ -412,3 +412,144 @@ def appliquer_stock_bl(db: Session, bl: Document):
         stock.quantite -= ligne.quantite
         db.add(MouvementStock(article_id=ligne.article_id, pdv_id=bl.pdv_id, type=TypeMouvement.SORTIE,
                               quantite=ligne.quantite, document_id=bl.id, commentaire=f"BL {bl.numero}"))
+# ============================== API ==============================
+app = FastAPI(title="GESCOM+GMAO multi-entités (métier IT)", version="1.0.0")
+
+@app.get("/api/health")
+def health(): return {"status": "ok"}
+
+@app.post("/api/auth/token")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.email == form.username).first()
+    if not u or not verify_password(form.password, u.hashed_password):
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    return {"access_token": create_token(u.id, u.role.value), "token_type": "bearer"}
+
+# --- Utilisateurs (création réservée aux admins) ---
+@app.post("/api/users", response_model=UserOut, status_code=201)
+def create_user(data: UserIn, db: Session = Depends(get_db), admin: User = Depends(require_role("admin_societe", "admin_groupe"))):
+    if data.role == Role.ADMIN_GROUPE and admin.role != Role.ADMIN_GROUPE:
+        raise HTTPException(status_code=403, detail="Seul un admin groupe crée un admin groupe")
+    if db.query(User).filter(User.email == data.email).first():
+        raise HTTPException(status_code=409, detail="Email déjà utilisé")
+    u = User(email=data.email, nom=data.nom, role=data.role, hashed_password=hash_password(data.password))
+    db.add(u); db.flush()
+    for e in data.entite_ids: db.add(UserEntite(user_id=u.id, entite_id=e))
+    for p in data.pdv_ids: db.add(UserPdv(user_id=u.id, pdv_id=p))
+    db.commit(); db.refresh(u); return u
+
+@app.get("/api/users", response_model=list[UserOut])
+def list_users(db: Session = Depends(get_db), admin: User = Depends(require_role("admin_societe", "admin_groupe"))):
+    return db.query(User).filter(User.actif == True).all()
+
+# --- Entités + PDV (paramétrages généraux = admin groupe) ---
+@app.post("/api/entites", response_model=EntiteOut, status_code=201)
+def create_entite(data: EntiteIn, db: Session = Depends(get_db), admin: User = Depends(require_role("admin_groupe"))):
+    if db.query(Entite).filter(Entite.nom == data.nom).first():
+        raise HTTPException(status_code=409, detail="Nom déjà utilisé")
+    e = Entite(**data.model_dump()); db.add(e); db.commit(); db.refresh(e); return e
+
+@app.get("/api/entites", response_model=list[EntiteOut])
+def list_entites(db: Session = Depends(get_db)):
+    return db.query(Entite).filter(Entite.actif == True).all()
+
+@app.post("/api/entites/{entite_id}/pdv", response_model=PdvOut, status_code=201)
+def create_pdv(entite_id: int, data: PdvIn, db: Session = Depends(get_db), admin: User = Depends(require_role("admin_groupe"))):
+    if not db.query(Entite).get(entite_id): raise HTTPException(status_code=404, detail="Entité introuvable")
+    if db.query(PointDeVente).filter(PointDeVente.entite_id == entite_id, PointDeVente.nom == data.nom).first():
+        raise HTTPException(status_code=409, detail="PDV déjà existant pour cette entité")
+    p = PointDeVente(entite_id=entite_id, **data.model_dump()); db.add(p); db.commit(); db.refresh(p); return p
+
+@app.get("/api/entites/{entite_id}/pdv", response_model=list[PdvOut])
+def list_pdv(entite_id: int, db: Session = Depends(get_db)):
+    return db.query(PointDeVente).filter(PointDeVente.entite_id == entite_id, PointDeVente.actif == True).all()
+
+STRUCTURE = [("ORIGIN INFO SYSTEM", ["PDV Principal", "PDV Secondaire"]),
+             ("SKYNET", ["PDV Skynet"]), ("ELEMIAH", [])]
+
+@app.post("/api/seed/structure")
+def seed(db: Session = Depends(get_db), admin: User = Depends(require_role("admin_groupe"))):
+    out = []
+    for nom, pdvs in STRUCTURE:
+        e = db.query(Entite).filter(Entite.nom == nom).first() or Entite(nom=nom)
+        if not e.id: db.add(e); db.flush()
+        for pn in pdvs:
+            if not db.query(PointDeVente).filter(PointDeVente.entite_id == e.id, PointDeVente.nom == pn).first():
+                db.add(PointDeVente(entite_id=e.id, nom=pn))
+        out.append({"entite": e.nom, "pdv": pdvs})
+    db.commit(); return {"message": "Structure OK (idempotent)", "entites": out}
+
+# --- Catalogue IT ---
+@app.post("/api/articles", response_model=ArticleOut, status_code=201)
+def create_article(data: ArticleIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if db.query(Article).filter(Article.reference == data.reference).first():
+        raise HTTPException(status_code=409, detail="Référence déjà existante")
+    a = Article(**data.model_dump()); db.add(a); db.commit(); db.refresh(a); return a
+
+@app.get("/api/articles", response_model=list[ArticleOut])
+def list_articles(categorie: CategorieArticle | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    q = db.query(Article).filter(Article.actif == True)
+    if categorie: q = q.filter(Article.categorie == categorie)
+    return q.order_by(Article.designation).all()
+
+@app.patch("/api/articles/{aid}", response_model=ArticleOut)
+def update_article(aid: int, prix_vente: float | None = None, actif: bool | None = None,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    a = db.query(Article).get(aid)
+    if not a: raise HTTPException(status_code=404, detail="Article introuvable")
+    if prix_vente is not None: a.prix_vente = prix_vente
+    if actif is not None: a.actif = actif
+    db.commit(); db.refresh(a); return a
+
+# --- Stocks par PDV ---
+def _get_stock(db, article_id, pdv_id) -> Stock:
+    s = db.query(Stock).get((article_id, pdv_id))
+    if not s:
+        s = Stock(article_id=article_id, pdv_id=pdv_id, quantite=0); db.add(s)
+    return s
+
+@app.get("/api/stocks/pdv/{pdv_id}")
+def stock_pdv(pdv_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rows = (db.query(Stock, Article).join(Article, Stock.article_id == Article.id)
+            .filter(Stock.pdv_id == pdv_id, Article.actif == True).all())
+    return [{"reference": a.reference, "designation": a.designation, "quantite": s.quantite,
+             "seuil_alerte": a.seuil_alerte, "alerte": s.quantite <= a.seuil_alerte} for s, a in rows]
+
+@app.get("/api/stocks/consolide")
+def stock_consolide(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rows = (db.query(Article, Stock, PointDeVente).join(Stock, Stock.article_id == Article.id)
+            .join(PointDeVente, Stock.pdv_id == PointDeVente.id).filter(Article.actif == True).all())
+    agg = {}
+    for a, s, p in rows:
+        agg.setdefault(a.id, {"article": a, "total": 0, "par_pdv": []})
+        agg[a.id]["total"] += s.quantite
+        agg[a.id]["par_pdv"].append({"pdv": p.nom, "entite": p.entite.nom, "quantite": s.quantite})
+    return [{"reference": v["article"].reference, "designation": v["article"].designation,
+             "quantite_totale": v["total"], "par_pdv": v["par_pdv"]} for v in agg.values()]
+
+@app.post("/api/stocks/pdv/{pdv_id}/mouvements", status_code=201)
+def mouvement(pdv_id: int, data: MouvementIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if not db.query(Article).get(data.article_id): raise HTTPException(status_code=404, detail="Article introuvable")
+    if not db.query(PointDeVente).get(pdv_id): raise HTTPException(status_code=404, detail="PDV introuvable")
+    s = _get_stock(db, data.article_id, pdv_id)
+    if data.type == TypeMouvement.TRANSFERT_OUT:
+        if not data.pdv_cible_id or data.pdv_cible_id == pdv_id:
+            raise HTTPException(status_code=400, detail="pdv_cible_id requis et différent")
+        if s.quantite < data.quantite: raise HTTPException(status_code=409, detail="Stock insuffisant")
+        s.quantite -= data.quantite
+        db.add(MouvementStock(article_id=data.article_id, pdv_id=pdv_id, type=data.type,
+                              quantite=data.quantite, pdv_cible_id=data.pdv_cible_id, commentaire=data.commentaire))
+        _get_stock(db, data.article_id, data.pdv_cible_id).quantite += data.quantite
+        db.add(MouvementStock(article_id=data.article_id, pdv_id=data.pdv_cible_id, type=TypeMouvement.TRANSFERT_IN,
+                              quantite=data.quantite, pdv_cible_id=pdv_id, commentaire=data.commentaire))
+    elif data.type == TypeMouvement.SORTIE:
+        if s.quantite < data.quantite: raise HTTPException(status_code=409, detail="Stock insuffisant (négatif interdit)")
+        s.quantite -= data.quantite
+        db.add(MouvementStock(article_id=data.article_id, pdv_id=pdv_id, type=data.type,
+                              quantite=data.quantite, commentaire=data.commentaire))
+    else:
+        s.quantite += data.quantite
+        db.add(MouvementStock(article_id=data.article_id, pdv_id=pdv_id, type=data.type,
+                              quantite=data.quantite, commentaire=data.commentaire))
+    db.commit()
+    return {"article_id": data.article_id, "pdv_id": pdv_id, "quantite_apres": s.quantite}
